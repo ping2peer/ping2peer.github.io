@@ -12,8 +12,14 @@ type MessageHandler = (envelope: ChatEnvelope) => void;
 type StateHandler = (state: TransportState) => void;
 
 const rtcConfig: RTCConfiguration = {
-  iceServers: []
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ],
+  iceCandidatePoolSize: 4
 };
+
+const iceGatheringTimeoutMs = 10000;
 
 export class WebRtcDataChannelTransport implements PeerTransport {
   private connection?: RTCPeerConnection;
@@ -23,6 +29,8 @@ export class WebRtcDataChannelTransport implements PeerTransport {
   private sessionId = createId("session");
   private currentState: TransportState = "idle";
   private heartbeatInterval?: number;
+  private disconnectedTimeout?: number;
+  private connectionTimeout?: number;
 
   get state(): TransportState {
     return this.currentState;
@@ -85,25 +93,37 @@ export class WebRtcDataChannelTransport implements PeerTransport {
     };
 
     signallingProvider.sendOffer(targetPeerId, signalWithKey as any);
+    this.startConnectionTimeout();
 
     return new Promise((resolve, reject) => {
+      let settled = false;
       const off = signallingProvider.onWebRtcAnswer((fromPeerId, signal) => {
         if (fromPeerId === targetPeerId) {
           off();
-          this.connection!.setRemoteDescription(signal)
+          this.connection!.setRemoteDescription({ type: signal.type, sdp: signal.sdp })
             .then(() => {
               const remoteKey = (signal as any).publicIdentityKey;
               if (!remoteKey) {
+                settled = true;
+                window.clearTimeout(timeout);
                 reject(new Error("Remote peer did not send public identity key"));
               } else {
+                settled = true;
+                window.clearTimeout(timeout);
                 resolve(remoteKey);
               }
             })
-            .catch(reject);
+            .catch((error) => {
+              settled = true;
+              window.clearTimeout(timeout);
+              reject(error);
+            });
         }
       });
       // Set a timeout to prevent hanging forever if peer disconnects
-      setTimeout(() => {
+      const timeout = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
         off();
         reject(new Error("Timeout waiting for WebRTC answer"));
       }, 15000);
@@ -128,7 +148,7 @@ export class WebRtcDataChannelTransport implements PeerTransport {
       throw new Error("Offer signal is missing public identity key");
     }
 
-    await this.connection.setRemoteDescription(offerSignal);
+    await this.connection.setRemoteDescription({ type: offerSignal.type, sdp: offerSignal.sdp });
     const answer = await this.connection.createAnswer();
     await this.connection.setLocalDescription(answer);
     await this.waitForIceGathering(this.connection);
@@ -141,6 +161,7 @@ export class WebRtcDataChannelTransport implements PeerTransport {
     };
 
     signallingProvider.sendAnswer(targetPeerId, signalWithKey as any);
+    this.startConnectionTimeout();
 
     return remoteKey;
   }
@@ -171,15 +192,39 @@ export class WebRtcDataChannelTransport implements PeerTransport {
   private createConnection(): RTCPeerConnection {
     const connection = new RTCPeerConnection(rtcConfig);
     connection.onconnectionstatechange = () => {
-      if (connection.connectionState === "connected") this.setState("connected");
-      if (connection.connectionState === "failed" || connection.connectionState === "disconnected") this.setState("failed");
-      if (connection.connectionState === "closed") this.setState("closed");
+      if (connection.connectionState === "connected") {
+        this.clearDisconnectedTimeout();
+        this.setState(this.channel?.readyState === "open" ? "connected" : "connecting");
+      }
+      if (connection.connectionState === "connecting" || connection.connectionState === "new") {
+        this.clearDisconnectedTimeout();
+        this.setState("connecting");
+      }
+      if (connection.connectionState === "disconnected") {
+        this.setState("connecting");
+        this.disconnectedTimeout ??= window.setTimeout(() => {
+          this.disconnectedTimeout = undefined;
+          if (this.connection?.connectionState === "disconnected") {
+            this.setState("failed");
+          }
+        }, 8000);
+      }
+      if (connection.connectionState === "failed") {
+        this.clearDisconnectedTimeout();
+        this.setState("failed");
+      }
+      if (connection.connectionState === "closed") {
+        this.clearDisconnectedTimeout();
+        this.setState("closed");
+      }
     };
     return connection;
   }
 
   private bindChannel(channel: RTCDataChannel): void {
     channel.onopen = () => {
+      this.clearDisconnectedTimeout();
+      this.clearConnectionTimeout();
       this.setState("connected");
       this.send({ type: "peer-ready", peerId: "remote" });
       this.startHeartbeat();
@@ -228,7 +273,7 @@ export class WebRtcDataChannelTransport implements PeerTransport {
   private async waitForIceGathering(connection: RTCPeerConnection): Promise<void> {
     if (connection.iceGatheringState === "complete") return;
     await new Promise<void>((resolve) => {
-      const timeout = window.setTimeout(resolve, 3000);
+      const timeout = window.setTimeout(resolve, iceGatheringTimeoutMs);
       connection.addEventListener("icegatheringstatechange", () => {
         if (connection.iceGatheringState === "complete") {
           window.clearTimeout(timeout);
@@ -240,8 +285,20 @@ export class WebRtcDataChannelTransport implements PeerTransport {
 
   private reset(sessionId = createId("session")): void {
     this.stopHeartbeat();
-    this.channel?.close();
-    this.connection?.close();
+    this.clearDisconnectedTimeout();
+    this.clearConnectionTimeout();
+    if (this.channel) {
+      this.channel.onopen = null;
+      this.channel.onclose = null;
+      this.channel.onerror = null;
+      this.channel.onmessage = null;
+      this.channel.close();
+    }
+    if (this.connection) {
+      this.connection.onconnectionstatechange = null;
+      this.connection.ondatachannel = null;
+      this.connection.close();
+    }
     this.channel = undefined;
     this.connection = undefined;
     this.sessionId = sessionId;
@@ -268,7 +325,32 @@ export class WebRtcDataChannelTransport implements PeerTransport {
     }
   }
 
+  private clearDisconnectedTimeout(): void {
+    if (this.disconnectedTimeout) {
+      window.clearTimeout(this.disconnectedTimeout);
+      this.disconnectedTimeout = undefined;
+    }
+  }
+
+  private startConnectionTimeout(): void {
+    this.clearConnectionTimeout();
+    this.connectionTimeout = window.setTimeout(() => {
+      if (this.currentState !== "connected") {
+        this.reset();
+        this.setState("failed");
+      }
+    }, 20000);
+  }
+
+  private clearConnectionTimeout(): void {
+    if (this.connectionTimeout) {
+      window.clearTimeout(this.connectionTimeout);
+      this.connectionTimeout = undefined;
+    }
+  }
+
   private setState(state: TransportState): void {
+    if (this.currentState === state) return;
     this.currentState = state;
     this.stateHandlers.forEach((handler) => handler(state));
   }

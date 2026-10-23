@@ -3,7 +3,7 @@
   "short_name": "Ping2Peer",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f8fafc",
-  "theme_color": "#0f172a",
+  "background_color": "#f8faf9",
+  "theme_color": "#164453",
   "icons": []
 }

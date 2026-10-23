@@ -25,6 +25,7 @@ export type Chat = {
   title: string;
   createdAt: number;
   updatedAt: number;
+  unreadCount?: number;
 };
 
 export type EncryptedMessage = {
@@ -110,9 +111,12 @@ export interface MessageStore {
   saveProfile(profile: DeviceProfile): Promise<void>;
   listChats(): Promise<Chat[]>;
   saveChat(chat: Chat): Promise<void>;
+  incrementUnread(chatId: ChatId): Promise<void>;
+  markChatRead(chatId: ChatId): Promise<void>;
   getChat(chatId: ChatId): Promise<Chat | undefined>;
   listMessages(chatId: ChatId): Promise<EncryptedMessage[]>;
   saveMessage(message: EncryptedMessage): Promise<void>;
+  toggleMessageReaction(chatId: ChatId, messageId: string, emoji: string, peerId: PeerId): Promise<void>;
   saveTrustedPeer(peer: TrustedPeer): Promise<void>;
   getTrustedPeer(peerId: PeerId): Promise<TrustedPeer | undefined>;
   clearChatMessages(chatId: ChatId): Promise<void>;
@@ -163,6 +167,7 @@ export type SignalClientMessage =
 // Server → Client messages
 export type SignalServerMessage =
   | { type: "peers"; peers: DiscoveredPeer[] }
+  | { type: "register-success"; peers: DiscoveredPeer[] }
   | { type: "peer-joined"; peer: DiscoveredPeer }
   | { type: "peer-left"; peerId: string }
   | { type: "connect-request"; from: DiscoveredPeer }

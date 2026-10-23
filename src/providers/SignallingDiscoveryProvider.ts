@@ -136,6 +136,7 @@ export class WebSocketSignallingProvider implements SignallingProvider {
     console.log("[Signal] Received message:", message.type, message);
     switch (message.type) {
       case "peers":
+      case "register-success":
         this.currentPeers = message.peers;
         this.emitPeers();
         break;

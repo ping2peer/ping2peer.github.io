@@ -29,7 +29,19 @@ describe("IndexedDbMessageStore", () => {
     await store.saveChat(chat);
     await store.saveMessage(message);
 
-    await expect(store.listChats()).resolves.toEqual([chat]);
+    await expect(store.listChats()).resolves.toEqual([{ ...chat, unreadCount: 0 }]);
     await expect(store.listMessages(chat.id)).resolves.toEqual([message]);
+
+    await store.incrementUnread(chat.id);
+    await store.incrementUnread(chat.id);
+    await store.saveChat({ ...chat, updatedAt: 4 });
+    await expect(store.getChat(chat.id)).resolves.toMatchObject({
+      createdAt: 1,
+      updatedAt: 4,
+      unreadCount: 2
+    });
+
+    await store.markChatRead(chat.id);
+    await expect(store.getChat(chat.id)).resolves.toMatchObject({ unreadCount: 0 });
   });
 });

@@ -4,6 +4,7 @@ import { IoCheckmark, IoAlertCircle, IoTimeOutline } from "react-icons/io5";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, TouchEvent as ReactTouchEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { createId } from "../lib/encoding";
+import { normalizeReactions, toggleExclusiveReaction } from "../lib/reactions";
 import { IndexedDbMessageStore } from "../providers/IndexedDbMessageStore";
 import { ManualPairingDiscoveryProvider } from "../providers/ManualPairingDiscoveryProvider";
 import { RelayTextTransport } from "../providers/RelayTextTransport";
@@ -34,7 +35,8 @@ const pendingInviteStorageKey = "ping2peer.pendingInvite";
 const pairingHandoffStorageKey = "ping2peer.pairingHandoff";
 const pairingChannelName = "ping2peer.pairing";
 const signalServerStorageKey = "ping2peer.signalServer";
-const themeStorageKey = "ping2peer.theme";
+const customSignalServerStorageKey = "ping2peer.customSignalServer";
+const DEFAULT_SIGNAL_SERVER = "wss://f1x7rgpuf3.execute-api.us-east-2.amazonaws.com/prod";
 
 const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
@@ -64,7 +66,7 @@ export function App() {
   const [screen, setScreen] = useState<Screen>("nearby");
   const [chats, setChats] = useState<Chat[]>([]);
   const [messages, setMessages] = useState<PlainMessage[]>([]);
-  
+
   // Multi-session state
   const [activeSessions, setActiveSessions] = useState<Record<string, ActiveSession>>({});
   const [sessionStates, setSessionStates] = useState<Record<string, TransportState>>({});
@@ -72,11 +74,14 @@ export function App() {
 
   const activeChatIdRef = useRef<string | null>(null);
   activeChatIdRef.current = activeChatId;
+  const screenRef = useRef(screen);
+  screenRef.current = screen;
 
   const activeSessionsRef = useRef(activeSessions);
   activeSessionsRef.current = activeSessions;
 
   const activeSession = activeChatId ? activeSessions[activeChatId] : undefined;
+  const activeChatKey = activeSession?.key;
   const activeChat = useMemo(() => chats.find(c => c.id === activeChatId), [chats, activeChatId]);
   const connectionState = activeChatId ? sessionStates[activeChatId] ?? "idle" : "idle";
 
@@ -86,7 +91,6 @@ export function App() {
   const [joinAnswerCode, setJoinAnswerCode] = useState("");
   const [messageText, setMessageText] = useState("");
   const [notice, setNotice] = useState("");
-  const [darkMode, setDarkMode] = useState(() => localStorage.getItem(themeStorageKey) === "dark");
   const [autoConnect, setAutoConnect] = useState(() => localStorage.getItem("ping2peer.autoConnect") !== "false");
   const [replyingTo, setReplyingTo] = useState<PlainMessage | null>(null);
   const [pickerMessageId, setPickerMessageId] = useState<string | null>(null);
@@ -96,16 +100,16 @@ export function App() {
   const [editDisplayName, setEditDisplayName] = useState("");
   const [editDeviceName, setEditDeviceName] = useState("");
 
-  const DEFAULT_SIGNAL_SERVER = "wss://f1x7rgpuf3.execute-api.us-east-2.amazonaws.com/prod";
-
-  const [customSignalServer, setCustomSignalServer] = useState(() => localStorage.getItem("ping2peer.customSignalServer") === "true");
-  const [signalServerUrl, setSignalServerUrl] = useState(() => {
-    let saved = localStorage.getItem(signalServerStorageKey);
-    if (saved && saved.startsWith("ws://") && window.location.protocol === "https:") {
-      saved = null;
-    }
-    return saved || DEFAULT_SIGNAL_SERVER;
+  const [customSignalServer, setCustomSignalServer] = useState(() => localStorage.getItem(customSignalServerStorageKey) === "true");
+  const [savedCustomSignalServerUrl, setSavedCustomSignalServerUrl] = useState(() => {
+    const saved = localStorage.getItem(signalServerStorageKey);
+    return saved && saved !== DEFAULT_SIGNAL_SERVER ? saved : "";
   });
+  const [customSignalServerDraft, setCustomSignalServerDraft] = useState(savedCustomSignalServerUrl);
+  const signalServerUrl = customSignalServer && savedCustomSignalServerUrl &&
+    (window.location.protocol !== "https:" || savedCustomSignalServerUrl.startsWith("wss://"))
+    ? savedCustomSignalServerUrl
+    : DEFAULT_SIGNAL_SERVER;
   const [signalState, setSignalState] = useState(signallingProvider.connectionState);
   const [nearbyPeers, setNearbyPeers] = useState<DiscoveredPeer[]>([]);
   const [incomingRequests, setIncomingRequests] = useState<ConnectionRequest[]>([]);
@@ -122,29 +126,23 @@ export function App() {
   const inviteTransportRef = useRef<PeerTransport | null>(null);
   const tabIdRef = useRef(createId("tab"));
   const processedLinkRef = useRef("");
+  const chatRefreshRef = useRef(0);
 
   // --- Auto-load messages effect ---
   useEffect(() => {
-    if (activeChatId && activeSessions[activeChatId]) {
-      void loadMessagesFor(activeChatId, activeSessions[activeChatId].key);
-    } else {
+    if (!activeChatId) {
       setMessages([]);
+    } else if (activeChatKey) {
+      void loadMessagesFor(activeChatId, activeChatKey);
     }
-  }, [activeChatId, activeSessions]);
+  }, [activeChatId, activeChatKey]);
 
-  const [themeColor, setThemeColor] = useState(() => localStorage.getItem("ping2peer.themeColor") || "26547C");
-
-  // --- Theme effect ---
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", darkMode ? "dark" : "light");
-    localStorage.setItem(themeStorageKey, darkMode ? "dark" : "light");
-  }, [darkMode]);
-
-  // --- Color effect ---
-  useEffect(() => {
-    document.documentElement.setAttribute("data-color", themeColor);
-    localStorage.setItem("ping2peer.themeColor", themeColor);
-  }, [themeColor]);
+    if (screen !== "chat" || !activeChatId) return;
+    const chatId = activeChatId;
+    setChats(current => current.map(chat => chat.id === chatId ? { ...chat, unreadCount: 0 } : chat));
+    void store.markChatRead(chatId).then(() => refreshChats());
+  }, [screen, activeChatId]);
 
   // --- Click to close dropdowns ---
   useEffect(() => {
@@ -215,8 +213,7 @@ export function App() {
         const isAuto = localStorage.getItem("ping2peer.autoConnect") !== "false";
         if (isAuto && profile) {
           peers.forEach(peer => {
-            const peerChatId = `chat_${peer.peerId}`;
-            const session = activeSessionsRef.current[peerChatId];
+            const session = Object.values(activeSessionsRef.current).find(s => s.peer.peerId === peer.peerId);
             const isConnectedOrConnecting = session && (session.transport.state === "connected" || session.transport.state === "connecting");
             // Skip if already connected/connecting or if an auto-connect attempt is in-flight
             if (isConnectedOrConnecting || autoConnectingRef.current.has(peer.peerId)) return;
@@ -229,7 +226,7 @@ export function App() {
             void store.getTrustedPeer(peer.peerId).then(trusted => {
               if (trusted) {
                 // Re-check after async gap
-                const sess = activeSessionsRef.current[peerChatId];
+                const sess = Object.values(activeSessionsRef.current).find(s => s.peer.peerId === peer.peerId);
                 if (sess && (sess.transport.state === "connected" || sess.transport.state === "connecting")) return;
                 if (autoConnectingRef.current.has(peer.peerId)) return;
                 if (pendingReqRef.current) return; // don't auto-connect while a manual request is pending
@@ -244,7 +241,7 @@ export function App() {
       signallingProvider.onConnectionRequest(async (req) => {
         const isOutgoingManual = pendingReqRef.current === req.from.peerId;
         const isOutgoingAuto = autoConnectingRef.current.has(req.from.peerId);
-        
+
         if (isOutgoingManual || isOutgoingAuto) {
           // Glare resolution: only the lower peerId device gets to be the initiator
           if (profile!.peerId < req.from.peerId) {
@@ -286,16 +283,14 @@ export function App() {
           return;
         }
         try {
-          const transport = createTransport();
-          if (transport instanceof WebRtcDataChannelTransport) {
-            const remotePublicKey = await transport.connectViaSignalling(profile, peerId, signallingProvider);
-            const session = await initializeSession(peer, remotePublicKey, transport);
-            attachSession(session);
-            if (isManualPending) {
-              setActiveChatId(session.chat.id);
-              setScreen("chat");
-            }
-            setNotice(`Connected to ${peer.displayName}`);
+          const transport = createSignallingTransport();
+          const remotePublicKey = await transport.connectViaSignalling(profile, peerId, signallingProvider);
+          const session = await initializeSession(peer, remotePublicKey, transport);
+          setNotice(`Negotiating secure chat with ${peer.displayName}...`);
+          attachSession(session);
+          if (isManualPending) {
+            setActiveChatId(session.chat.id);
+            setScreen("chat");
           }
         } catch (err) {
           setNotice(errorMessage(err, "Failed to connect via signalling"));
@@ -319,17 +314,15 @@ export function App() {
         autoAcceptedRef.current.delete(peerId);
         yieldedManualRef.current.delete(peerId);
         try {
-          const transport = createTransport();
-          if (transport instanceof WebRtcDataChannelTransport) {
-            const remotePublicKey = await transport.acceptViaSignalling(profile, peerId, signal, signallingProvider);
-            const session = await initializeSession(peer, remotePublicKey, transport);
-            attachSession(session);
-            // Only navigate to chat for manual accepts; auto-accept silently establishes
-            if (!wasAutoAccepted || wasYieldedManual) {
-              setActiveChatId(session.chat.id);
-              setScreen("chat");
-            }
-            setNotice(`Connected to ${peer.displayName}`);
+          const transport = createSignallingTransport();
+          const remotePublicKey = await transport.acceptViaSignalling(profile, peerId, signal, signallingProvider);
+          const session = await initializeSession(peer, remotePublicKey, transport);
+          setNotice(`Negotiating secure chat with ${peer.displayName}...`);
+          attachSession(session);
+          // Only navigate to chat for manual accepts; auto-accept silently establishes
+          if (!wasAutoAccepted || wasYieldedManual) {
+            setActiveChatId(session.chat.id);
+            setScreen("chat");
           }
         } catch (err) {
           setNotice(errorMessage(err, "Failed to accept WebRTC offer"));
@@ -340,10 +333,14 @@ export function App() {
     return () => offs.forEach(off => off());
   }, [profile, signalServerUrl]);
 
+  const latestTransportRef = useRef<Record<string, PeerTransport>>({});
+
   const activeTitle = useMemo(() => activeSession?.chat.title ?? activeChat?.title ?? "Ping2Peer", [activeSession, activeChat]);
 
   async function refreshChats() {
-    setChats(await store.listChats());
+    const request = ++chatRefreshRef.current;
+    const savedChats = await store.listChats();
+    if (request === chatRefreshRef.current) setChats(savedChats);
   }
 
   function attachSession(session: ActiveSession) {
@@ -351,22 +348,30 @@ export function App() {
     const transport = session.transport;
 
     // Disconnect any old transport being replaced for this chatId
-    const existing = activeSessionsRef.current[chatId];
-    if (existing && existing.transport !== transport) {
-      try { existing.transport.disconnect(); } catch { /* already closed */ }
+    const existingTransport = latestTransportRef.current[chatId];
+    if (existingTransport && existingTransport !== transport) {
+      try { existingTransport.disconnect(); } catch { /* already closed */ }
     }
 
+    latestTransportRef.current[chatId] = transport;
+
     setActiveSessions(prev => ({ ...prev, [chatId]: session }));
-    setSessionStates(prev => ({ ...prev, [chatId]: session.transport.state }));
-    
+    setSessionStates(prev => ({ ...prev, [chatId]: transport.state }));
+
     transport.onStateChange((state) => {
-      // Guard: only process if this transport is still the active one.
-      // Prevents a stale transport's "closed" event from nuking a newer session.
-      const current = activeSessionsRef.current[chatId];
-      if (current && current.transport !== transport) return;
+      if (latestTransportRef.current[chatId] !== transport) return;
 
       setSessionStates(prev => ({ ...prev, [chatId]: state }));
+      if (state === "connected" || state === "failed" || state === "closed") {
+        const negotiatingNotice = `Negotiating secure chat with ${session.peer.displayName}...`;
+        setNotice(current => current === negotiatingNotice
+          ? (state === "failed" ? `Could not connect to ${session.peer.displayName}` : "")
+          : current);
+      }
       if (state === "failed" || state === "closed") {
+        if (latestTransportRef.current[chatId] === transport) {
+          delete latestTransportRef.current[chatId];
+        }
         setActiveSessions(prev => {
           if (prev[chatId]?.transport !== transport) return prev; // double-check inside setter
           const next = { ...prev };
@@ -375,7 +380,7 @@ export function App() {
         });
       }
     });
-    
+
     transport.onMessage((envelope) => {
       void handleIncomingEnvelope(envelope, session);
     });
@@ -507,7 +512,7 @@ export function App() {
   async function loadMessagesFor(chatId: string, key: ChatKey) {
     const encryptedMessages = await store.listMessages(chatId);
     const plainMessages = await decryptMessages(key, encryptedMessages);
-    setMessages(plainMessages);
+    if (activeChatIdRef.current === chatId) setMessages(plainMessages);
   }
 
   async function initializeSession(peerPayload: PairingPayload["peer"] | DiscoveredPeer, remotePublicKey: JsonWebKey, transport: PeerTransport): Promise<ActiveSession> {
@@ -552,7 +557,7 @@ export function App() {
     };
     await store.saveMessage(message);
     await store.saveChat({ ...activeSession.chat, updatedAt: message.sentAt });
-    
+
     if (activeChatIdRef.current === activeSession.chat.id) {
       setMessages((current) => [{ ...message, body }, ...current]);
     }
@@ -592,22 +597,21 @@ export function App() {
     }
   }
 
+  async function persistReaction(chatId: string, messageId: string, emoji: string, senderPeerId: string) {
+    if (activeChatIdRef.current === chatId) {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== messageId) return m;
+        return { ...m, reactions: toggleExclusiveReaction(m.reactions, emoji, senderPeerId) };
+      }));
+    }
+    await store.toggleMessageReaction(chatId, messageId, emoji, senderPeerId);
+  }
+
   function handleReaction(messageId: string, emoji: string) {
     if (!profile || !activeSession) return;
     setPickerMessageId(null);
 
-    setMessages(prev => prev.map(m => {
-      if (m.id !== messageId) return m;
-      const reactions = { ...(m.reactions ?? {}) };
-      const list = reactions[emoji] ?? [];
-      if (list.includes(profile.peerId)) {
-        reactions[emoji] = list.filter(id => id !== profile.peerId);
-        if (reactions[emoji].length === 0) delete reactions[emoji];
-      } else {
-        reactions[emoji] = [...list, profile.peerId];
-      }
-      return { ...m, reactions };
-    }));
+    void persistReaction(activeSession.chat.id, messageId, emoji, profile.peerId);
 
     if (connectionState === "connected") {
       try {
@@ -620,7 +624,9 @@ export function App() {
     if (!activeSession) return;
     if (confirm("Are you sure you want to clear chat history? This cannot be undone.")) {
       await store.clearChatMessages(activeSession.chat.id);
+      await store.markChatRead(activeSession.chat.id);
       setMessages([]);
+      await refreshChats();
       setNotice("Chat history cleared");
     }
   }
@@ -642,32 +648,27 @@ export function App() {
 
   async function handleIncomingEnvelope(envelope: ChatEnvelope, session: ActiveSession) {
     if (envelope.type === "reaction") {
-      if (activeChatIdRef.current === session.chat.id) {
-        setMessages(prev => prev.map(m => {
-          if (m.id !== envelope.messageId) return m;
-          const reactions = { ...(m.reactions ?? {}) };
-          const list = reactions[envelope.reaction] ?? [];
-          if (list.includes(envelope.senderPeerId)) {
-            reactions[envelope.reaction] = list.filter(id => id !== envelope.senderPeerId);
-            if (reactions[envelope.reaction].length === 0) delete reactions[envelope.reaction];
-          } else {
-            reactions[envelope.reaction] = [...list, envelope.senderPeerId];
-          }
-          return { ...m, reactions };
-        }));
-      }
+      void persistReaction(session.chat.id, envelope.messageId, envelope.reaction, session.peer.peerId);
       return;
     }
     if (envelope.type !== "chat-message") return;
     const body = await cryptoProvider.decryptText(session.key, envelope.message.ciphertext, envelope.message.nonce);
-    const received: EncryptedMessage = { 
-      ...envelope.message, 
+    const received: EncryptedMessage = {
+      ...envelope.message,
       chatId: session.chat.id, // Ensure it's saved under the local chat ID
-      deliveryState: "received" 
+      deliveryState: "received"
     };
     await store.saveMessage(received);
     await store.saveChat({ ...session.chat, updatedAt: received.sentAt });
-    
+
+    const isOpenChat = screenRef.current === "chat" && activeChatIdRef.current === session.chat.id;
+    if (!isOpenChat) {
+      await store.incrementUnread(session.chat.id);
+      if (screenRef.current === "chat" && activeChatIdRef.current === session.chat.id) {
+        await store.markChatRead(session.chat.id);
+      }
+    }
+
     if (activeChatIdRef.current === session.chat.id) {
       setMessages((current) => [{ ...received, body }, ...current]);
     }
@@ -680,10 +681,11 @@ export function App() {
       try {
         output.push({
           ...message,
+          reactions: normalizeReactions(message.reactions),
           body: await cryptoProvider.decryptText(key, message.ciphertext, message.nonce)
         });
       } catch {
-        output.push({ ...message, body: "[Unable to decrypt]" });
+        output.push({ ...message, reactions: normalizeReactions(message.reactions), body: "[Unable to decrypt]" });
       }
     }
     return output;
@@ -745,9 +747,22 @@ export function App() {
 
   function saveSettings(event: FormEvent) {
     event.preventDefault();
-    localStorage.setItem(signalServerStorageKey, signalServerUrl);
-    signallingProvider.disconnect();
-    signallingProvider.connect(signalServerUrl, profile!);
+    const nextUrl = customSignalServerDraft.trim();
+    try {
+      const parsed = new URL(nextUrl);
+      if ((parsed.protocol !== "ws:" && parsed.protocol !== "wss:") ||
+          (window.location.protocol === "https:" && parsed.protocol !== "wss:")) {
+        setNotice(window.location.protocol === "https:"
+          ? "Use a secure wss:// signal server on HTTPS."
+          : "Use a ws:// or wss:// signal server.");
+        return;
+      }
+    } catch {
+      setNotice("Enter a valid signal server URL.");
+      return;
+    }
+    localStorage.setItem(signalServerStorageKey, nextUrl);
+    setSavedCustomSignalServerUrl(nextUrl);
     setNotice("Settings saved");
     setScreen("nearby");
   }
@@ -785,6 +800,7 @@ export function App() {
   ];
 
   const currentNav = screen === "chat" || screen === "create" || screen === "join" ? undefined : screen;
+  const unreadTotal = chats.reduce((total, chat) => total + (chat.unreadCount ?? 0), 0);
 
   return (
     <main className="app-shell">
@@ -793,7 +809,7 @@ export function App() {
         <div className="global-popup-overlay">
           <div className="global-popup">
             <h3>Incoming Request</h3>
-            <p><strong>{incomingRequests[0].from.displayName}</strong> wants to connect.</p>
+            <p><span>{incomingRequests[0].from.displayName}</span> wants to connect.</p>
             <div className="action-row">
               <button className="primary-action" onClick={() => {
                 signallingProvider.acceptConnection(incomingRequests[0].from.peerId);
@@ -810,19 +826,20 @@ export function App() {
 
       {/* === Desktop Left Sidebar === */}
       <aside className="sidebar">
-        <div className="sidebar-brand" style={{ fontWeight: "normal" }}>Ping2Peer</div>
+        <div className="sidebar-brand">Ping2Peer</div>
         <nav className="sidebar-nav">
           {navItems.map(item => (
-            <button key={item.id} className={`sidebar-nav-item ${currentNav === item.id ? "active" : ""}`} onClick={() => setScreen(item.id)}>
+            <button key={item.id} className={`sidebar-nav-item ${currentNav === item.id ? "active" : ""}`} onClick={() => setScreen(item.id)} aria-label={item.id === "chats" && unreadTotal > 0 ? `Chats, ${unreadTotal} new messages` : item.label}>
               {item.icon}
               {item.label}
+              {item.id === "chats" && unreadTotal > 0 && <span className="unread-badge" aria-hidden="true">{unreadTotal > 99 ? "99+" : unreadTotal}</span>}
             </button>
           ))}
         </nav>
         <div className="sidebar-profile">
           <div className="sidebar-profile-avatar">{profile.displayName.charAt(0).toUpperCase()}</div>
           <div className="sidebar-profile-info">
-            <strong>{profile.displayName}</strong>
+            <span className="profile-name">{profile.displayName}</span>
             <small>{profile.deviceName}</small>
           </div>
         </div>
@@ -841,7 +858,7 @@ export function App() {
           <header className="top-bar">
             <button className="top-bar-back" onClick={() => setScreen("chats")} aria-label="Back"><ChevronLeft size={22} /></button>
             <div className="top-bar-center">
-              <strong>{activeChat.title}</strong>
+              <span className="chat-title">{activeChat.title}</span>
               <div className="status-line">
                 <span className={`status-dot ${connectionState === "connected" ? "online" : "offline"}`} />
                 {connectionState === "connected" ? "online" : "offline"}
@@ -867,10 +884,13 @@ export function App() {
           <section className="screen">
             <div className="action-row">
               <p style={{ gridColumn: "1 / -1", margin: 0 }}>
-                <strong>{signalState === "connected" ? "Online on local network" : "Offline / Connecting..."}</strong>
+                <span>{signalState === "connected" ? "Online on local network" : "Offline / Connecting..."}</span>
               </p>
             </div>
             <div className="chat-list">
+              <p className="intro-text" style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '24px', lineHeight: '1.5' }}>
+                Ping2Peer is a decentralized, peer-to-peer messaging app that enables direct device-to-device communication over LAN or Wi-Fi without relying on any chat servers.
+              </p>
               <h3>Nearby Devices</h3>
               {(() => {
                 const mergedList: { peerId: string; displayName: string; deviceName: string; isOnline: boolean }[] = [
@@ -896,37 +916,37 @@ export function App() {
                 if (mergedList.length === 0) return <p className="empty-state">No devices found</p>;
 
                 return mergedList.map((peer) => {
-                  const peerChatId = `chat_${peer.peerId}`;
-                  const isConnected = sessionStates[peerChatId] === "connected";
+                  const matchedChat = chats.find(c => c.peerId === peer.peerId);
+                  const isConnected = matchedChat ? sessionStates[matchedChat.id] === "connected" : false;
                   return (
                     <div className="chat-item" key={peer.peerId}>
                       <div>
-                        <span>{peer.displayName} {!peer.isOnline && <small style={{ display: "inline", color: "var(--text-tertiary)", fontWeight: "normal" }}>(Offline)</small>}</span>
-                        <small>{peer.deviceName}</small>
+                        <span>{peer.displayName}</span>
+                        <small className="device-name">{peer.deviceName}</small>
                       </div>
-                      {isConnected ? (
+                      {isConnected && matchedChat ? (
                         <button className="disconnect-button-inline" onClick={() => {
-                          const session = activeSessions[peerChatId];
+                          const session = activeSessions[matchedChat.id];
                           if (session && confirm(`Disconnect from ${peer.displayName}?`)) {
                             session.transport.disconnect();
                             setActiveSessions(prev => {
                               const next = { ...prev };
-                              delete next[peerChatId];
+                              delete next[matchedChat.id];
                               return next;
                             });
                             setSessionStates(prev => {
                               const next = { ...prev };
-                              delete next[peerChatId];
+                              delete next[matchedChat.id];
                               return next;
                             });
-                            if (activeChatId === peerChatId) setActiveChatId(null);
+                            if (activeChatId === matchedChat.id) setActiveChatId(null);
                             setNotice("Disconnected");
                           }
                         }}><LogOut size={16} /> Disconnect</button>
                       ) : pendingOutgoingRequest === peer.peerId ? (
                         <small style={{ color: "var(--accent)" }}>Waiting...</small>
                       ) : (
-                        <button 
+                        <button
                           disabled={!peer.isOnline}
                           style={!peer.isOnline ? { opacity: 0.5, cursor: "not-allowed", background: "var(--bg-secondary)", color: "var(--text-tertiary)" } : {}}
                           onClick={() => {
@@ -957,11 +977,12 @@ export function App() {
                   <div style={{ flex: 1, cursor: "pointer" }} onClick={() => void openExistingChat(chat)}>
                     <span style={{ display: "block" }}>{chat.title}</span>
                     <small>
-                      {sessionStates[chat.id] === "connected" ? <span style={{color: "var(--success)"}}>● Connected</span> : new Date(chat.updatedAt).toLocaleString()}
+                      {sessionStates[chat.id] === "connected" ? <span style={{ color: "var(--success)" }}>● Connected</span> : new Date(chat.updatedAt).toLocaleString()}
                     </small>
+                    {(chat.unreadCount ?? 0) > 0 && <small className="chat-unread-text">{chat.unreadCount} new {chat.unreadCount === 1 ? "message" : "messages"}</small>}
                   </div>
                   <div style={{ position: "relative" }}>
-                    <button className="icon-button" onClick={(e) => {
+                    <button className="icon-button chat-menu-button" onClick={(e) => {
                       e.stopPropagation();
                       setOpenMenuChatId(openMenuChatId === chat.id ? null : chat.id);
                     }} title="Menu" aria-label="Menu">
@@ -990,13 +1011,14 @@ export function App() {
                           color: "var(--danger)",
                           cursor: "pointer",
                           fontSize: "0.85rem",
-                          fontWeight: 600,
                           width: "100%"
                         }} onClick={async (e) => {
                           e.stopPropagation();
                           setOpenMenuChatId(null);
                           if (confirm(`Are you sure you want to clear chat history for ${chat.title}? This cannot be undone.`)) {
                             await store.clearChatMessages(chat.id);
+                            await store.markChatRead(chat.id);
+                            await refreshChats();
                             if (activeChatId === chat.id) {
                               setMessages([]);
                             }
@@ -1035,58 +1057,21 @@ export function App() {
         {/* === Settings Screen === */}
         {screen === "settings" && (
           <section className="screen stack">
-            <h2>Settings</h2>
-            <div className="theme-color-section">
-              <span className="theme-toggle-label" style={{ display: "block", marginBottom: "8px" }}>Theme Color</span>
-              <div className="theme-color-row" style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
-                {["5B8C5A", "26547C", "96616B", "83BCA9", "3E5641", "D4B483"].map(color => (
-                  <button
-                    key={color}
-                    type="button"
-                    onClick={() => setThemeColor(color)}
-                    style={{
-                      width: "36px",
-                      height: "36px",
-                      borderRadius: "50%",
-                      backgroundColor: `#${color}`,
-                      border: themeColor === color ? "3px solid var(--text-primary)" : "1px solid var(--border)",
-                      cursor: "pointer",
-                      boxShadow: themeColor === color ? "0 0 8px rgba(0,0,0,0.2)" : "none",
-                      padding: 0,
-                      transition: "transform 0.1s, border-color 0.1s"
-                    }}
-                    title={`#${color}`}
-                    aria-label={`Theme color #${color}`}
-                  />
-                ))}
-              </div>
-            </div>
-            <div className="theme-toggle">
-              <span className="theme-toggle-label">Dark Mode</span>
-              <button type="button" className={`toggle-switch ${darkMode ? "active" : ""}`} onClick={() => setDarkMode(!darkMode)} aria-label="Toggle dark mode" />
-            </div>
-            <div className="theme-toggle">
-              <span className="theme-toggle-label">Auto Connect (Known Devices)</span>
+            <div className="settings-row">
+              <span className="settings-label">Auto Connect (Known Devices)</span>
               <button type="button" className={`toggle-switch ${autoConnect ? "active" : ""}`} onClick={() => {
                 const next = !autoConnect;
                 setAutoConnect(next);
                 localStorage.setItem("ping2peer.autoConnect", String(next));
               }} aria-label="Toggle auto connect" />
             </div>
-             <div className="theme-toggle">
-              <span className="theme-toggle-label">Custom Signal Server</span>
+            <div className="settings-row">
+              <span className="settings-label">Custom Signal Server</span>
               <button type="button" className={`toggle-switch ${customSignalServer ? "active" : ""}`} onClick={() => {
                 const next = !customSignalServer;
                 setCustomSignalServer(next);
-                localStorage.setItem("ping2peer.customSignalServer", String(next));
+                localStorage.setItem(customSignalServerStorageKey, String(next));
                 if (!next) {
-                  // Revert immediately to default
-                  setSignalServerUrl(DEFAULT_SIGNAL_SERVER);
-                  localStorage.setItem(signalServerStorageKey, DEFAULT_SIGNAL_SERVER);
-                  if (profile) {
-                    signallingProvider.disconnect();
-                    signallingProvider.connect(DEFAULT_SIGNAL_SERVER, profile);
-                  }
                   setNotice("Signal server reverted to default");
                 }
               }} aria-label="Toggle custom signal server" />
@@ -1095,7 +1080,7 @@ export function App() {
               <form onSubmit={saveSettings} className="stack">
                 <label>
                   Signal Server URL
-                  <input value={signalServerUrl} onChange={(e) => setSignalServerUrl(e.target.value)} required />
+                  <input value={customSignalServerDraft} onChange={(e) => setCustomSignalServerDraft(e.target.value)} placeholder="wss://your-server.example" required />
                 </label>
                 <button className="primary-action" type="submit">Save</button>
               </form>
@@ -1161,11 +1146,11 @@ export function App() {
             )}
 
             <form className="composer" onSubmit={sendMessage}>
-              <input 
-                value={messageText} 
-                onChange={(e) => setMessageText(e.target.value)} 
+              <input
+                value={messageText}
+                onChange={(e) => setMessageText(e.target.value)}
                 placeholder={connectionState === "connected" ? "Message" : "Waiting for connection..."}
-                disabled={connectionState !== "connected"} 
+                disabled={connectionState !== "connected"}
               />
               <button className="send-button" type="submit" aria-label="Send" disabled={connectionState !== "connected"}><IoSend size={20} /></button>
             </form>
@@ -1177,9 +1162,10 @@ export function App() {
       {screen !== "chat" && (
         <nav className="bottom-tabs">
           {navItems.map(item => (
-            <button key={item.id} className={`bottom-tab ${currentNav === item.id ? "active" : ""}`} onClick={() => setScreen(item.id)}>
+            <button key={item.id} className={`bottom-tab ${currentNav === item.id ? "active" : ""}`} onClick={() => setScreen(item.id)} aria-label={item.id === "chats" && unreadTotal > 0 ? `Chats, ${unreadTotal} new messages` : item.label}>
               {item.icon}
               {item.label}
+              {item.id === "chats" && unreadTotal > 0 && <span className="unread-badge" aria-hidden="true">{unreadTotal > 99 ? "99+" : unreadTotal}</span>}
             </button>
           ))}
         </nav>
@@ -1327,6 +1313,13 @@ function defaultDeviceName(): string {
 function createTransport(payload?: PairingPayload): PeerTransport {
   if (payload?.signal.sdp?.startsWith("relay:") || !window.isSecureContext || typeof RTCPeerConnection === "undefined") {
     return new RelayTextTransport();
+  }
+  return new WebRtcDataChannelTransport();
+}
+
+function createSignallingTransport(): WebRtcDataChannelTransport {
+  if (typeof RTCPeerConnection === "undefined") {
+    throw new Error("This browser does not support WebRTC peer connections.");
   }
   return new WebRtcDataChannelTransport();
 }

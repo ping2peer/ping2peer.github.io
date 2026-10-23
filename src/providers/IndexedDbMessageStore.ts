@@ -1,4 +1,5 @@
 import type { Chat, ChatId, DeviceProfile, EncryptedMessage, MessageStore, PeerId, TrustedPeer } from "../types";
+import { toggleExclusiveReaction } from "../lib/reactions";
 
 const dbName = "ping2peer-v1";
 const dbVersion = 1;
@@ -22,7 +23,33 @@ export class IndexedDbMessageStore implements MessageStore {
   }
 
   async saveChat(chat: Chat): Promise<void> {
-    await this.put("chats", chat);
+    const db = await this.db();
+    return new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction("chats", "readwrite");
+      const chats = transaction.objectStore("chats");
+      const request = chats.get(chat.id);
+      request.onsuccess = () => {
+        const existing = request.result as Chat | undefined;
+        chats.put({
+          ...existing,
+          ...chat,
+          createdAt: existing?.createdAt ?? chat.createdAt,
+          updatedAt: Math.max(existing?.updatedAt ?? 0, chat.updatedAt),
+          unreadCount: existing?.unreadCount ?? chat.unreadCount ?? 0
+        });
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  }
+
+  async incrementUnread(chatId: ChatId): Promise<void> {
+    await this.updateUnreadCount(chatId, count => count + 1);
+  }
+
+  async markChatRead(chatId: ChatId): Promise<void> {
+    await this.updateUnreadCount(chatId, () => 0);
   }
 
   async getChat(chatId: ChatId): Promise<Chat | undefined> {
@@ -36,6 +63,27 @@ export class IndexedDbMessageStore implements MessageStore {
 
   async saveMessage(message: EncryptedMessage): Promise<void> {
     await this.put("messages", message);
+  }
+
+  async toggleMessageReaction(chatId: ChatId, messageId: string, emoji: string, peerId: PeerId): Promise<void> {
+    const db = await this.db();
+    return new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction("messages", "readwrite");
+      const messages = transaction.objectStore("messages");
+      const request = messages.get(messageId);
+      request.onsuccess = () => {
+        const message = request.result as EncryptedMessage | undefined;
+        if (message?.chatId === chatId) {
+          messages.put({
+            ...message,
+            reactions: toggleExclusiveReaction(message.reactions, emoji, peerId)
+          });
+        }
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
   }
 
   async saveTrustedPeer(peer: TrustedPeer): Promise<void> {
@@ -63,6 +111,22 @@ export class IndexedDbMessageStore implements MessageStore {
           resolve();
         }
       };
+    });
+  }
+
+  private async updateUnreadCount(chatId: ChatId, update: (count: number) => number): Promise<void> {
+    const db = await this.db();
+    return new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction("chats", "readwrite");
+      const chats = transaction.objectStore("chats");
+      const request = chats.get(chatId);
+      request.onsuccess = () => {
+        const chat = request.result as Chat | undefined;
+        if (chat) chats.put({ ...chat, unreadCount: update(chat.unreadCount ?? 0) });
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
     });
   }
 
